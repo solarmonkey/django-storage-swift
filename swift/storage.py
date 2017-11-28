@@ -2,6 +2,7 @@ import hmac
 import mimetypes
 import magic
 import os
+import posixpath
 import re
 from datetime import datetime
 from hashlib import sha1
@@ -11,6 +12,7 @@ from time import time
 from django.utils.deconstruct import deconstructible
 
 from django.conf import settings
+from django.contrib.staticfiles.storage import CachedFilesMixin, ManifestFilesMixin
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files import File
 from django.core.files.storage import Storage
@@ -38,6 +40,100 @@ def ensure_setup(func):
             self._setup()
         return func(self, *args)
     return inner
+
+def safe_normpath(path):
+    """
+    Avoid doing normpath on empty path since:
+    - posixpath.normpath('') -> '.'
+    - we should avoid relative paths with swift
+    """
+    if path:
+        return posixpath.normpath(path)
+    return path
+
+
+def validate_settings(backend):
+    # Check mandatory parameters
+    if not backend.api_auth_url:
+        raise ImproperlyConfigured("The SWIFT_AUTH_URL setting is required")
+
+    if not backend.api_username:
+        raise ImproperlyConfigured("The SWIFT_USERNAME setting is required")
+
+    if not backend.api_key:
+        raise ImproperlyConfigured("The SWIFT_KEY or SWIFT_PASSWORD setting is required")
+
+    if not backend.container_name:
+        raise ImproperlyConfigured("No container name defined. Use SWIFT_CONTAINER_NAME \
+        or SWIFT_STATIC_CONTAINER_NAME depending on the backend")
+
+    # Detect auth version if not defined
+    # http://docs.openstack.org/developer/python-swiftclient/cli.html#authentication
+    if not backend.auth_version:
+        if (backend.user_domain_name or backend.user_domain_id) and \
+           (backend.project_domain_name or backend.project_domain_id):
+            # Set version 3 if domain and project scoping is defined
+            backend.auth_version = '3'
+        else:
+            if backend.tenant_name or backend.tenant_id:
+                # Set version 2 if a tenant is defined
+                backend.auth_version = '2'
+            else:
+                # Set version 1 if no tenant is not defined
+                backend.auth_version = '1'
+
+    # Enforce auth_version into a string (more future proof)
+    backend.auth_version = str(backend.auth_version)
+
+    # Validate v2 auth parameters
+    if backend.auth_version == '2':
+        if not (backend.tenant_name or backend.tenant_id):
+            raise ImproperlyConfigured("SWIFT_TENANT_ID or SWIFT_TENANT_NAME must \
+             be defined when using version 2 auth")
+
+    # Validate v3 auth parameters
+    if backend.auth_version == '3':
+        if not (backend.user_domain_name or backend.user_domain_id):
+            raise ImproperlyConfigured("SWIFT_USER_DOMAIN_NAME or \
+            SWIFT_USER_DOMAIN_ID must be defined when using version 3 auth")
+
+        if not (backend.project_domain_name or backend.project_domain_id):
+            raise ImproperlyConfigured("SWIFT_PROJECT_DOMAIN_NAME or \
+            SWIFT_PROJECT_DOMAIN_ID must be defined when using version 3 auth")
+
+        if not (backend.tenant_name or backend.tenant_id):
+            raise ImproperlyConfigured("SWIFT_PROJECT_ID or SWIFT_PROJECT_NAME must \
+             be defined when using version 3 auth")
+
+    # Validate temp_url parameters
+    if backend.use_temp_urls:
+        if backend.temp_url_key is None:
+            raise ImproperlyConfigured("SWIFT_TEMP_URL_KEY must be set when \
+             SWIFT_USE_TEMP_URL is True")
+
+        # Encode temp_url_key as bytes
+        try:
+            backend.temp_url_key = backend.temp_url_key.encode('ascii')
+        except UnicodeEncodeError:
+            raise ImproperlyConfigured("SWIFT_TEMP_URL_KEY must ascii")
+
+    # Misc sanity checks
+    if not isinstance(backend.os_extra_options, dict):
+        raise ImproperlyConfigured("SWIFT_EXTRA_OPTIONS must be a dict")
+
+
+def prepend_name_prefix(func):
+    """
+    Decorator that wraps instance methods to prepend the instance's filename
+    prefix to the beginning of the referenced filename. Must only be used on
+    instance methods where the first parameter after `self` is `name` or a
+    comparable parameter of a different name.
+    """
+    @wraps(func)
+    def prepend_prefix(self, name, *args, **kwargs):
+        name = self.name_prefix + safe_normpath(name)
+        return func(self, name, *args, **kwargs)
+    return prepend_prefix
 
 
 @deconstructible
@@ -179,8 +275,8 @@ class SwiftStorage(Storage):
 
     @ensure_setup
     def _open(self, name, mode='rb'):
-        if self.name_prefix:
-            name = self.name_prefix + name
+        original_name = name
+        name = self.name_prefix + safe_normpath(name)
 
         headers, content = swiftclient.get_object(self.storage_url,
                                                   self.token,
@@ -193,9 +289,9 @@ class SwiftStorage(Storage):
         return File(buf)
 
     @ensure_setup
-    def _save(self, name, content):
-        if self.name_prefix:
-            name = self.name_prefix + name
+    def _save(self, name, content, headers=None):
+        original_name = name
+        name = self.name_prefix + safe_normpath(name)
 
         if self.content_type_from_fd:
             content_type = magic.from_buffer(content.read(1024), mime=True)
@@ -358,3 +454,23 @@ class StaticSwiftStorage(SwiftStorage):
         overwrite it.
         """
         return name
+
+
+class CachedStaticSwiftStorage(CachedFilesMixin, StaticSwiftStorage):
+    """
+    A static file system storage backend which also saves
+    hashed copies of the files it saves.
+    """
+    pass
+
+
+class ManifestStaticSwiftStorage(ManifestFilesMixin, StaticSwiftStorage):
+    """
+    A static file system storage backend which also saves
+    hashed copies of the files it saves.
+    """
+    def read_manifest(self):
+        try:
+            super(ManifestStaticSwiftStorage, self).read_manifest()
+        except swiftclient.ClientException:
+            return None
