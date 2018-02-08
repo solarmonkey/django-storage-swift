@@ -242,6 +242,9 @@ class SwiftStorage(Storage):
         return File(buf)
 
     def _save(self, name, content, headers=None):
+        # File may have already be read, always seek to the beginning
+        content.seek(0)
+
         original_name = name
         name = self.name_prefix + safe_normpath(name)
 
@@ -402,7 +405,16 @@ class StaticSwiftStorage(SwiftStorage):
         return name
 
 
-class CachedStaticSwiftStorage(CachedFilesMixin, StaticSwiftStorage):
+class SwiftHashedFilesMixin(object):
+    def file_hash(self, name, content=None):
+        # Hash must be performed on the whole file content: always seek to 0.
+        if content is not None and content.seekable:
+            content.seek(0)
+
+        return super(SwiftHashedFilesMixin, self).file_hash(name, content)
+
+
+class CachedStaticSwiftStorage(SwiftHashedFilesMixin, CachedFilesMixin, StaticSwiftStorage):
     """
     A static file system storage backend which also saves
     hashed copies of the files it saves.
@@ -410,7 +422,7 @@ class CachedStaticSwiftStorage(CachedFilesMixin, StaticSwiftStorage):
     pass
 
 
-class ManifestStaticSwiftStorage(ManifestFilesMixin, StaticSwiftStorage):
+class ManifestStaticSwiftStorage(SwiftHashedFilesMixin, ManifestFilesMixin, StaticSwiftStorage):
     """
     A static file system storage backend which also saves
     hashed copies of the files it saves.
