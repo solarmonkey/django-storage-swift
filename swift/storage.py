@@ -27,8 +27,22 @@ except ImportError:
     raise ImproperlyConfigured("Could not load swiftclient library")
 
 
-def setting(name, default=None):
-    return getattr(settings, name, default)
+def setting(name, default='__not_set__'):
+    try:
+        return getattr(settings, name)
+    except AttributeError:
+        if default != '__not_set__':
+            return default
+        raise ImproperlyConfigured('The {} setting is required'.format(name))
+
+
+def ensure_setup(func):
+    def inner(self, *args):
+        if self.storage_url is None:
+            self._setup()
+        return func(self, *args)
+    return inner
+
 
 
 def safe_normpath(path):
@@ -146,9 +160,9 @@ class SwiftStorage(Storage):
     auto_create_container_allow_orgin = setting(
         'SWIFT_AUTO_CREATE_CONTAINER_ALLOW_ORIGIN')
     auto_base_url = setting('SWIFT_AUTO_BASE_URL', True)
-    override_base_url = setting('SWIFT_BASE_URL')
+    override_base_url = setting('SWIFT_BASE_URL', None)
     use_temp_urls = setting('SWIFT_USE_TEMP_URLS', False)
-    temp_url_key = setting('SWIFT_TEMP_URL_KEY')
+    temp_url_key = setting('SWIFT_TEMP_URL_KEY', None)
     temp_url_duration = setting('SWIFT_TEMP_URL_DURATION', 30 * 60)
     auth_token_duration = setting('SWIFT_AUTH_TOKEN_DURATION', 60 * 60 * 23)
     os_extra_options = setting('SWIFT_EXTRA_OPTIONS', {})
@@ -172,6 +186,22 @@ class SwiftStorage(Storage):
         self.last_headers_name = None
         self.last_headers_value = None
 
+        # Initialize empty, meaning that this instance is not setup yet. See
+        # `_setup` below
+        self.storage_url = None
+
+    def _setup(self):
+        """
+        Separate setup method for `storage_url` and `token` initialization.
+
+        By separating this out of `__init__`, it becomes possible to use
+        SwiftStorage as the non-default storage, without calling the storage on
+        each django bootstrap. (Which is very annoying in development, as
+        every dev-server reboot first then needs to connect to storage storage.)
+
+        Each method that uses any of `token`, `storage_url` or `base_url` should
+        be decorated with `ensure_setup`.
+        """
         self.os_options = {
             'tenant_id': self.tenant_id,
             'tenant_name': self.tenant_name,
@@ -183,15 +213,14 @@ class SwiftStorage(Storage):
         }
         self.os_options.update(self.os_extra_options)
 
-        # Get Connection wrapper
-        self.swift_conn = swiftclient.Connection(
-            authurl=self.api_auth_url,
-            user=self.api_username,
-            key=self.api_key,
-            retries=self.max_retries,
-            tenant_name=self.tenant_name,
-            os_options=self.os_options,
-            auth_version=self.auth_version)
+        # Get authentication token
+        self.storage_url, self.token = swiftclient.get_auth(
+            self.api_auth_url,
+            self.api_username,
+            self.api_key,
+            auth_version=self.auth_version,
+            os_options=self.os_options)
+        self.http_conn = swiftclient.http_connection(self.storage_url)
 
         # Check container
         try:
@@ -231,6 +260,24 @@ class SwiftStorage(Storage):
         else:
             self.base_url = self.override_base_url
 
+    def get_token(self):
+        if time() - self._token_creation_time >= self.auth_token_duration:
+            new_token = swiftclient.get_auth(
+                self.api_auth_url,
+                self.api_username,
+                self.api_key,
+                auth_version=self.auth_version,
+                os_options=self.os_options)[1]
+            self.token = new_token
+        return self._token
+
+    def set_token(self, new_token):
+        self._token_creation_time = time()
+        self._token = new_token
+
+    token = property(get_token, set_token)
+
+    @ensure_setup
     def _open(self, name, mode='rb'):
         original_name = name
         name = self.name_prefix + safe_normpath(name)
@@ -241,11 +288,11 @@ class SwiftStorage(Storage):
         buf.mode = mode
         return File(buf)
 
+    @ensure_setup
     def _save(self, name, content, headers=None):
+        original_name = name
         # File may have already be read, always seek to the beginning
         content.seek(0)
-
-        original_name = name
         name = self.name_prefix + safe_normpath(name)
 
         if self.content_type_from_fd:
@@ -263,6 +310,7 @@ class SwiftStorage(Storage):
                                    headers=headers)
         return original_name
 
+    @ensure_setup
     def get_headers(self, name):
         """
         Optimization : only fetch headers once when several calls are made
@@ -279,6 +327,7 @@ class SwiftStorage(Storage):
         return self.last_headers_value
 
     @prepend_name_prefix
+    @ensure_setup
     def exists(self, name):
         try:
             self.get_headers(name)
@@ -287,6 +336,7 @@ class SwiftStorage(Storage):
         return True
 
     @prepend_name_prefix
+    @ensure_setup
     def delete(self, name):
         try:
             self.swift_conn.delete_object(self.container_name, name)
@@ -332,6 +382,7 @@ class SwiftStorage(Storage):
     def url(self, name):
         return self._path(name)
 
+    @ensure_setup
     def _path(self, name):
         try:
             name = name.encode('utf-8')
@@ -356,6 +407,7 @@ class SwiftStorage(Storage):
         return '.' not in name
 
     @prepend_name_prefix
+    @ensure_setup
     def listdir(self, path):
         container = self.swift_conn.get_container(
             self.container_name, prefix=path, full_listing=self.full_listing)
@@ -373,12 +425,14 @@ class SwiftStorage(Storage):
         return dirs, files
 
     @prepend_name_prefix
+    @ensure_setup
     def makedirs(self, dirs):
         self.swift_conn.put_object(self.container_name,
                                    '%s/.' % (self.name_prefix + dirs),
                                    contents='')
 
     @prepend_name_prefix
+    @ensure_setup
     def rmtree(self, abs_path):
         container = self.swift_conn.get_container(self.container_name)
 
@@ -392,9 +446,9 @@ class StaticSwiftStorage(SwiftStorage):
     container_name = setting('SWIFT_STATIC_CONTAINER_NAME', '')
     name_prefix = setting('SWIFT_STATIC_NAME_PREFIX', '')
     auto_base_url = setting('SWIFT_STATIC_AUTO_BASE_URL', True)
-    override_base_url = setting('SWIFT_STATIC_BASE_URL')
     auto_create_container_public = True
     use_temp_urls = False
+    override_base_url = setting('SWIFT_STATIC_BASE_URL', '')
 
     def get_available_name(self, name, max_length=None):
         """
