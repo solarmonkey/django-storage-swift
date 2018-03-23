@@ -221,6 +221,7 @@ class SwiftStorage(Storage):
             auth_version=self.auth_version,
             os_options=self.os_options)
         self.http_conn = swiftclient.http_connection(self.storage_url)
+        self.swift_conn = self.http_conn
 
         # Check container
         try:
