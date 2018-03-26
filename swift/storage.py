@@ -447,6 +447,6 @@ class ManifestStaticSwiftStorage(SwiftHashedFilesMixin, ManifestFilesMixin, Stat
     """
     def read_manifest(self):
         try:
-            super(ManifestStaticSwiftStorage, self).read_manifest()
+            return super(ManifestStaticSwiftStorage, self).read_manifest()
         except swiftclient.ClientException:
             return None
