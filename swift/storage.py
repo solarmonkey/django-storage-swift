@@ -101,12 +101,6 @@ def validate_settings(backend):
             raise ImproperlyConfigured("SWIFT_TEMP_URL_KEY must be set when \
              SWIFT_USE_TEMP_URL is True")
 
-        # Encode temp_url_key as bytes
-        try:
-            backend.temp_url_key = backend.temp_url_key.encode('ascii')
-        except UnicodeEncodeError:
-            raise ImproperlyConfigured("SWIFT_TEMP_URL_KEY must ascii")
-
     # Misc sanity checks
     if not isinstance(backend.os_extra_options, dict):
         raise ImproperlyConfigured("SWIFT_EXTRA_OPTIONS must be a dict")
