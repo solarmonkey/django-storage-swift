@@ -339,6 +339,10 @@ class SwiftStorage(Storage):
     def modified_time(self, name):
         return datetime.fromtimestamp(
             float(self.get_headers(name)['x-timestamp']))
+    
+    @prepend_name_prefix
+    def get_modified_time(self, name):
+        return self.modified_time(name)
 
     @prepend_name_prefix
     def url(self, name):
