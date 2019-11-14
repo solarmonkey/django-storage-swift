@@ -221,7 +221,7 @@ class SwiftStorage(Storage):
     @property
     def base_url(self):
         if self._base_url is None:
-            if self.auto_base_url:
+            if self.auto_base_url and self.swift_conn:
                 # Derive a base URL based on the authentication information from
                 # the server, optionally overriding the protocol, host/port and
                 # potentially adding a path fragment before the auth information.
@@ -339,7 +339,7 @@ class SwiftStorage(Storage):
     def modified_time(self, name):
         return datetime.fromtimestamp(
             float(self.get_headers(name)['x-timestamp']))
-    
+
     @prepend_name_prefix
     def get_modified_time(self, name):
         return self.modified_time(name)
